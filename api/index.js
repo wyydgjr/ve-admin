@@ -1,12 +1,17 @@
-const jsonServer = require('json-server')
+const express = require('express')
+const fs = require('fs')
 const path = require('path')
 
-const server = jsonServer.create()
-const router = jsonServer.router(path.join(__dirname, '..', 'db.json'))
-const middlewares = jsonServer.defaults({ logger: false })
+const server = express()
 
-server.use(middlewares)
-server.use(jsonServer.bodyParser)
+let db = {}
+try {
+  db = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'db.json'), 'utf-8'))
+} catch (_) {
+  db = { users: [], products: [], categories: [], orders: [] }
+}
+
+server.use(express.json())
 
 server.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*')
@@ -22,7 +27,6 @@ server.get('/api/health', (req, res) => {
 
 server.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body
-  const db = router.db.getState()
   const user = db.users.find((u) => u.username === username && u.password === password)
   if (!user) return res.status(401).json({ message: '用户名或密码错误' })
   const { password: _, ...safeUser } = user
@@ -33,7 +37,6 @@ server.get('/api/auth/userinfo', (req, res) => {
   const auth = req.headers.authorization
   if (!auth) return res.status(401).json({ message: '未登录' })
   const id = auth.replace('Bearer mock-jwt-token-', '')
-  const db = router.db.getState()
   const user = db.users.find((u) => u.id === Number(id))
   if (!user) return res.status(401).json({ message: '用户不存在' })
   const { password: _, ...safeUser } = user
@@ -44,19 +47,16 @@ server.put('/api/auth/profile', (req, res) => {
   const auth = req.headers.authorization
   if (!auth) return res.status(401).json({ message: '未登录' })
   const id = auth.replace('Bearer mock-jwt-token-', '')
-  const db = router.db.getState()
   const idx = db.users.findIndex((u) => u.id === Number(id))
   if (idx === -1) return res.status(401).json({ message: '用户不存在' })
   const { password, ...rest } = req.body
   Object.assign(db.users[idx], rest)
   if (password) db.users[idx].password = password
-  router.db.write()
   const { password: _, ...safeUser } = db.users[idx]
   res.json({ user: safeUser })
 })
 
 server.get('/api/dashboard/stats', (req, res) => {
-  const db = router.db.getState()
   const userCount = db.users.length
   const productCount = db.products.length
   const orderCount = db.orders.length
@@ -68,7 +68,6 @@ server.get('/api/dashboard/stats', (req, res) => {
 })
 
 server.get('/api/dashboard/activities', (req, res) => {
-  const db = router.db.getState()
   const activities = []
   db.users.slice(-5).reverse().forEach((u) => {
     activities.push({ type: '新增用户', content: `用户「${u.username}」已注册`, time: u.createdAt })
@@ -85,7 +84,6 @@ server.get('/api/dashboard/activities', (req, res) => {
 })
 
 server.get('/api/dashboard/revenue', (req, res) => {
-  const db = router.db.getState()
   const monthMap = {}
   db.orders.filter((o) => o.status === 'completed').forEach((o) => {
     const m = (o.createdAt || '').slice(0, 7)
@@ -95,43 +93,42 @@ server.get('/api/dashboard/revenue', (req, res) => {
   res.json({ months, values: months.map((m) => monthMap[m]) })
 })
 
-server.use('/api', (req, res, next) => {
-  if (req.method === 'GET') {
-    const resource = req.path.replace('/api/', '').split('?')[0]
-    if ((resource === 'users' || resource === 'products' || resource === 'categories' || resource === 'orders') && req.query.keyword) {
-      const db = router.db.getState()
-      const keyword = req.query.keyword.toLowerCase()
-      let filtered = db[resource].filter((item) =>
-        Object.values(item).some((v) => String(v).toLowerCase().includes(keyword))
-      )
-      const total = filtered.length
-      const page = Number(req.query.page) || 1
-      const pageSize = Number(req.query.pageSize) || 20
-      const start = (page - 1) * pageSize
-      filtered = filtered.slice(start, start + pageSize)
-      return res.json({ list: filtered, total })
-    }
+function paginatedList(data, query) {
+  const keyword = query.keyword
+  let filtered = data
+  if (keyword) {
+    const kw = keyword.toLowerCase()
+    filtered = data.filter((item) =>
+      Object.values(item).some((v) => String(v).toLowerCase().includes(kw))
+    )
   }
-  next()
+  const total = filtered.length
+  const page = Number(query.page) || 1
+  const pageSize = Number(query.pageSize) || 20
+  const start = (page - 1) * pageSize
+  return { list: filtered.slice(start, start + pageSize), total }
+}
+
+server.get('/api/users', (req, res) => res.json(paginatedList(db.users, req.query)))
+server.get('/api/products', (req, res) => res.json(paginatedList(db.products, req.query)))
+server.get('/api/categories', (req, res) => res.json(paginatedList(db.categories, req.query)))
+server.get('/api/orders', (req, res) => res.json(paginatedList(db.orders, req.query)))
+
+server.get('/api/users/:id', (req, res) => {
+  const item = db.users.find((i) => i.id === Number(req.params.id))
+  item ? res.json(item) : res.status(404).json({ message: '未找到' })
 })
-
-server.use(jsonServer.rewriter({ '/api/*': '/$1' }))
-
-server.use((req, res, next) => {
-  const originalJson = res.json.bind(res)
-  res.json = function (body) {
-    if (Array.isArray(body)) {
-      const page = Number(req.query._page) || 1
-      const pageSize = Number(req.query._limit) || 20
-      const start = (page - 1) * pageSize
-      const items = body.slice(start, start + pageSize)
-      return originalJson({ list: items, total: body.length })
-    }
-    return originalJson(body)
-  }
-  next()
+server.get('/api/products/:id', (req, res) => {
+  const item = db.products.find((i) => i.id === Number(req.params.id))
+  item ? res.json(item) : res.status(404).json({ message: '未找到' })
 })
-
-server.use(router)
+server.get('/api/categories/:id', (req, res) => {
+  const item = db.categories.find((i) => i.id === Number(req.params.id))
+  item ? res.json(item) : res.status(404).json({ message: '未找到' })
+})
+server.get('/api/orders/:id', (req, res) => {
+  const item = db.orders.find((i) => i.id === Number(req.params.id))
+  item ? res.json(item) : res.status(404).json({ message: '未找到' })
+})
 
 module.exports = server
